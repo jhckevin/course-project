@@ -91,29 +91,28 @@ static int load_random(Dataset *ds)
     return 0;
 }
 
-/*--- CSV 批量导入（留桩，可扩展为多文件并发） ----------*/
-static int load_csv_list(Dataset *ds, const char *path_list)
+/*--- CSV 导入 ------------------------------------------------*/
+static int load_csv(Dataset *ds, const char *csv_path)
 {
-    /* path_list 指向一个包含若干 CSV 路径的文本文件，每行一个路径
-       此处仅示例读取第一行 CSV，真实场景可并发 & 逐个生成结果              */
-    FILE *fpList = fopen(path_list,"r");
-    if (!fpList){ perror("fopen list"); return -1; }
+    FILE *fp = fopen(csv_path, "r");
+    if (!fp) { perror("fopen csv"); return -1; }
 
-    char csvPath[BUF_SZ];
-    if (!fgets(csvPath,sizeof(csvPath),fpList)){ fclose(fpList); return -1; }
-    fclose(fpList);
-    csvPath[strcspn(csvPath,"\r\n")] = '\0';   /* 去掉换行 */
-
-    FILE *fp = fopen(csvPath,"r");
-    if (!fp){ perror("open csv"); return -1; }
-
-    int n=0, val;
-    while (fscanf(fp,"%d",&val)==1 && n<MAX_N){
-        ds->raw[n++] = val;
+    int n = 0, val;     /* 支持逗号或换行分隔 */
+    char line[BUF_SZ];
+    while (fgets(line, sizeof(line), fp) && n < MAX_N) {
+        char *tok = strtok(line, ",\n\r");
+        while (tok && n < MAX_N) {
+            if (sscanf(tok, "%d", &val) == 1)
+                ds->raw[n++] = val;
+            tok = strtok(NULL, ",\n\r");
+        }
     }
     fclose(fp);
-    if (n<20){ fprintf(stderr,"CSV 元素不足 20\n"); return -1; }
-    ds->n=n;
+    if (n < 20) {
+        fprintf(stderr, "CSV 元素不足 20\n");
+        return -1;
+    }
+    ds->n = n;
     return 0;
 }
 
@@ -245,6 +244,38 @@ static void sort_array(int *a,int n, SortAlg alg)
         default:        quick_sort_wrapper(a,n);  break;
     }
 }
+
+/*------------ 插入单个整数并保持归类后序列有序 ----------*/
+static int insert_value(Dataset *ds, int val)
+{
+    if (ds->n >= MAX_N) {
+        fprintf(stderr, "数据已满，无法插入\n");
+        return -1;
+    }
+    ds->raw[ds->n++] = val;
+
+    if (ds->n_odd + ds->n_even == ds->n - 1) {
+        /* 已经归类过，维护有序插入 */
+        if (is_odd(val)) {
+            int i = ds->n_odd;
+            while (i > 0 && ds->odd[i-1] > val) {
+                ds->odd[i] = ds->odd[i-1];
+                --i;
+            }
+            ds->odd[i] = val;
+            ds->n_odd++;
+        } else {
+            int i = ds->n_even;
+            while (i > 0 && ds->even[i-1] > val) {
+                ds->even[i] = ds->even[i-1];
+                --i;
+            }
+            ds->even[i] = val;
+            ds->n_even++;
+        }
+    }
+    return 0;
+}
 /*====================== 座位映射 =========================*
  * 根据 cfg 生成 seatMap，返回有效行列（通过 cfg.rows/cols） */
 static void gen_seat_map(const Dataset *ds,
@@ -363,11 +394,15 @@ static void render_ascii(const Seat seatMap[MAX_R][MAX_C],
 /*====================== CSV 导出 =========================*/
 static void write_csv(const Dataset *ds,
                       const Seat seatMap[MAX_R][MAX_C],
-                      const SeatCfg *cfg)
+                      const SeatCfg *cfg,
+                      const char *odd_path,
+                      const char *even_path,
+                      const char *seat_path)
 {
     /* odd.csv / even.csv */
-    FILE *fo = fopen("odd.csv", "w");
-    FILE *fe = fopen("even.csv", "w");
+    FILE *fo = fopen(odd_path, "w");
+    FILE *fe = fopen(even_path, "w");
+    if (!fo || !fe) { perror("fopen"); if(fo)fclose(fo); if(fe)fclose(fe); return; }
     for (int i=0;i<ds->n_odd;++i) fprintf(fo,"%d%s",ds->odd[i],
                     (i==ds->n_odd-1?"\n":","));
     for (int i=0;i<ds->n_even;++i) fprintf(fe,"%d%s",ds->even[i],
@@ -375,7 +410,8 @@ static void write_csv(const Dataset *ds,
     fclose(fo); fclose(fe);
 
     /* seat_map.csv ：行、列与 id */
-    FILE *fs = fopen("seat_map.csv","w");
+    FILE *fs = fopen(seat_path,"w");
+    if (!fs) { perror("fopen"); return; }
     for (int r = 0; r < cfg->rows; ++r){
         for (int c = 0; c < cfg->cols; ++c){
             fprintf(fs,"%d%s", seatMap[r][c].id,
@@ -384,7 +420,7 @@ static void write_csv(const Dataset *ds,
         fputc('\n',fs);
     }
     fclose(fs);
-    printf("已导出 odd.csv / even.csv / seat_map.csv\n");
+    printf("已导出 %s / %s / %s\n", odd_path, even_path, seat_path);
 }
 
 /*====================== 性能测试 =========================*/
@@ -424,21 +460,22 @@ static void menu_loop(void)
         puts("[4] 座位排布设置  (L/R or F/B, 奇数在哪侧)");
         puts("[5] 排座并显示+导出");
         puts("[6] 性能测试      (当前配置)");
+        puts("[7] 插入一个整数");
         puts("[q] 退出");
         printf(">>> ");
         if (!fgets(cmd,sizeof(cmd),stdin)) break;
 
         switch (cmd[0]) {
         case '1': {
-            printf("a) 手动  b) 随机  c) CSV 列表文件\n>> ");
+            printf("a) 手动  b) 随机  c) CSV 文件\n>> ");
             char m = getchar(); while(getchar()!='\n');
             int ok=-1;
             if (m=='a') ok = load_manual(&ds);
             else if (m=='b') ok = load_random(&ds);
             else if (m=='c') {
                 char path[128];
-                printf("列表文件路径："); scanf("%127s",path); while(getchar()!='\n');
-                ok = load_csv_list(&ds, path);
+                printf("CSV 路径："); scanf("%127s",path); while(getchar()!='\n');
+                ok = load_csv(&ds, path);
             }
             if (!ok) puts("数据载入完成！");
             break; }
@@ -465,11 +502,27 @@ static void menu_loop(void)
             sort_array(ds.even, ds.n_even, sorter);
             gen_seat_map(&ds, seatMap, &cfg);
             render_ascii(seatMap, &cfg);
-            write_csv(&ds, seatMap, &cfg);
+            char odd_f[128] = "odd.csv", even_f[128] = "even.csv", seat_f[128] = "seat_map.csv";
+            printf("奇数 CSV 路径(默认 odd.csv): ");
+            fgets(cmd, sizeof(cmd), stdin);
+            if (cmd[0] != '\n') { cmd[strcspn(cmd,"\r\n")] = '\0'; strncpy(odd_f, cmd, sizeof(odd_f)-1); }
+            printf("偶数 CSV 路径(默认 even.csv): ");
+            fgets(cmd, sizeof(cmd), stdin);
+            if (cmd[0] != '\n') { cmd[strcspn(cmd,"\r\n")] = '\0'; strncpy(even_f, cmd, sizeof(even_f)-1); }
+            printf("座位 CSV 路径(默认 seat_map.csv): ");
+            fgets(cmd, sizeof(cmd), stdin);
+            if (cmd[0] != '\n') { cmd[strcspn(cmd,"\r\n")] = '\0'; strncpy(seat_f, cmd, sizeof(seat_f)-1); }
+            write_csv(&ds, seatMap, &cfg, odd_f, even_f, seat_f);
             break; }
         case '6': {
             if (ds.n<20){ puts("请先载入数据！"); break; }
             bench_once(&ds, classifier, sorter);
+            break; }
+        case '7': {
+            printf("输入要插入的整数：");
+            int v; if (scanf("%d", &v)!=1){ puts("输入错误"); while(getchar()!='\n'); break; }
+            while(getchar()!='\n');
+            if (!insert_value(&ds, v)) puts("已插入");
             break; }
         case 'q': return;
         default : break;
@@ -480,7 +533,6 @@ static void menu_loop(void)
 int main(void)
 {
     menu_loop();
-    print 
     return 0;
 }
 
